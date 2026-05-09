@@ -4,3 +4,9 @@ so it may or may not be the latest driver.
 Extra note: I have not played with the hardware watchdog yet, but after a few minutes it will auto-ramp the fans back to max.
 I might eventually come back with an auto fan override that watches the environment sensors, but as is this is
 just the raw drivers with no changes
+
+## Installation
+1. Download the driver(s) you want
+2. Put them in `/opt`
+3. Run `sudo chmod +x /opt/octofan/*` (you should probably be more selective, I did `*` anyway)
+4. Use the driver specific commands for more usage

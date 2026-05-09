@@ -1,0 +1,67 @@
+#!/bin/bash
+
+[[ -z $1 ]] || [[ -z $2 ]] &&
+	echo "Usage: `basename $0` serial_number slot_number eb_serial" &&
+	exit 1
+## REQUIRED packages: socat (apt-get install socat)
+
+
+## Other Linux Systems than SimpleMining OS - unhash 3 lines below and hash SimpleMiningOS ones
+srrEnabled="1"
+srrSerial=$1
+slot=$2
+ebSerial=$3
+
+echo "srrSerial " $srrSerial
+echo "slot " $slot
+echo "ebSerial " $ebSerial
+
+if [ "$srrEnabled" -eq 1  ]; then
+	echo "SRR is Enabled"
+else
+	echo "SRR Not configured. SRR Agent will exit in 120 seconds"
+	sleep 120
+	exit
+fi
+
+
+if [ ${#ebSerial} == 6 ]; then
+	## For Extension Board ports only
+	ebSlot=`printf %02X $(( ${slot} - 1 ))`
+	firstByte="FF"
+	byteCount="000b"
+	action="5c"
+	mac="485053$srrSerial"
+	checksum=`printf %02X $(( (0x${byteCount:0:2} + 0x${byteCount:2:2} + 0x$action + 0x${mac:0:2} + 0x${mac:2:2} + 0x${mac:4:2} + 0x${mac:6:2} + 0x${mac:8:2} + 0x${mac:10:2} + 0x${ebSerial:0:2} + 0x${ebSerial:2:2} + 0x${ebSerial:4:2} + 0x$ebSlot)%0x100  ))`
+	packet2="$firstByte$byteCount$action$mac$ebSerial$ebSlot$checksum"
+
+	while true
+	do
+		echo "Sending keepallive packet to EB:$ebSerial attached to SRR:$srrSerial on slot:$slot. Message:$packet2"
+		echo -n "$packet2" | xxd -r -p |socat - UDP-DATAGRAM:255.255.255.255:1051,broadcast > /dev/null &
+		sleep 2
+	done
+else
+	## For SRR ports only
+	srrSlot=`printf %02X $(( ${slot} - 1 ))`
+	firstByte="FF"
+	byteCount="0008"
+	action="55"
+	mac="485053$srrSerial"
+	checksum=`printf %02X $(( (0x${byteCount:0:2} + 0x${byteCount:2:2} + 0x$action + 0x${mac:0:2} + 0x${mac:2:2} + 0x${mac:4:2} + 0x${mac:6:2} + 0x${mac:8:2} + 0x${mac:10:2} + 0x$srrSlot)%0x100  ))`
+	packet1="$firstByte$byteCount$action$mac$srrSlot$checksum"
+
+	port=22
+	while true
+	do
+		echo "Sending keepallive packet to SRR:$srrSerial on slot:$slot. Message: $packet1"
+		if nc -w 1 -z localhost $port 2>&1; then
+			echo -n "$packet1" | xxd -r -p | socat - UDP-DATAGRAM:255.255.255.255:1051,broadcast > /dev/null &
+		else
+			logger -s -t "$(basename "$0")" "NOT pinging watchdog - sshd port: $port"
+			port=`grep -oP "^Port[\s]+\K[0-9]+" /etc/ssh/sshd_config 2>/dev/null | tail -n 1`
+			[[ -z $port ]] && port=22
+		fi
+		sleep 5
+	done
+fi

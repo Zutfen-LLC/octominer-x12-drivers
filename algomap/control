@@ -1,0 +1,9 @@
+Package: hive-opt-algomap
+Version: 128
+Section: base
+Priority: optional
+Architecture: all
+Maintainer: Bee <bee@hiveos.farm>
+Description: Algorithms mapping
+Depends: hive-opt(>=0.6-10)
+

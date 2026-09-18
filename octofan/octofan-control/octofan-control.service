@@ -1,0 +1,12 @@
+[Unit]
+Description=Octominer slot-aware fan controller
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/octofan-control
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

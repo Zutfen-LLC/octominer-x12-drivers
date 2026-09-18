@@ -1,0 +1,269 @@
+#!/usr/bin/env python3
+"""octofan-control: slot-aware zoned fan control for Octominer X12 chassis.
+
+Drives the Octominer USB fan controller (fan_controller_cli) so case fans
+follow the temperature of the GPU(s) physically in front of them, instead
+of ganging every channel to one temperature.
+
+Model
+-----
+* Fans are named by physical position (FAN1..FAN5, left to right facing
+  the rig) and mapped to controller channels in config.
+* PCIe slots are mapped to the fan(s) that cover them. A slot between two
+  fans is a "bridge" slot and lists BOTH fans at a reduced duty (two fans
+  in parallel need less PWM each; the temperature-feedback loop steps the
+  curve up if the estimate runs lean).
+* Slots listed as occupied follow the card curve, input = max temperature
+  over all configured hwmon sensors (e.g. both dies of a dual-die card,
+  or several NVIDIA cards). All other fans sit at a quiet background
+  floor with a mild high-temperature ramp so hot air cannot pool.
+
+NUMBERING LANDMINE (MINERDUDE 12XTREME): case fans count LEFT to RIGHT;
+PCIe slots count RIGHT to LEFT (slot 1 = rightmost). State the
+convention whenever you touch a mapping.
+
+Safety
+------
+* Every fan target is re-asserted every poll, so a manual
+  fan_controller_cli write can only desync the rig for one poll.
+* Fail-safe: N consecutive polls with no readable GPU temperature drive
+  ALL fans to full PWM (the controller hardware watchdog is typically
+  disabled, so this software guard is the only one).
+* The controller's EEPROM boot default (defPWM) provides pre-daemon boot
+  airflow; keep it at a safe value (e.g. 100 ~= 40%).
+
+Config: /etc/octofan-control.conf (INI; see octofan-control.conf example).
+Usage: octofan-control [config-path]   (run as root via systemd)
+"""
+import configparser
+import glob
+import subprocess
+import sys
+import time
+
+DEFAULT_CONF = "/etc/octofan-control.conf"
+
+
+def load_config(path):
+    cp = configparser.ConfigParser()
+    cp.optionxform = str  # preserve case: FAN1, DB1, MB1...
+    if not cp.read(path):
+        raise SystemExit(f"octofan-control: config not found: {path}")
+
+    def get(section, option, fallback=None):
+        if cp.has_option(section, option):
+            return cp.get(section, option)
+        return fallback
+
+    cfg = {
+        "cli": get("controller", "cli", "/usr/local/bin/fan_controller_cli"),
+        "poll": float(get("controller", "poll_seconds", "5")),
+        "hyst": float(get("controller", "step_hysteresis", "2")),
+        "floor": int(get("controller", "floor_pwm", "38")),
+        "fans": {},
+        "slots": {},
+        "card_slots": [],
+        "hwmon_names": set(),
+        "sensors": [],
+        "card_curve": [],
+        "bg_curve": [],
+    }
+
+    for name, ch in cp.items("fans"):
+        cfg["fans"][name.strip()] = int(ch)
+
+    for slot, spec in cp.items("slots"):
+        fans = []
+        for part in spec.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if "@" in part:
+                fan, scale = part.split("@", 1)
+                fans.append((fan.strip(), float(scale)))
+            else:
+                fans.append((part, 1.0))
+        cfg["slots"][slot.strip()] = fans
+
+    cards = get("cards", "slots", "")
+    cfg["card_slots"] = [s.strip() for s in cards.split(",") if s.strip()]
+
+    names = get("sensors", "hwmon_names", "amdgpu")
+    cfg["hwmon_names"] = {n.strip() for n in names.split(",") if n.strip()}
+    sensors = get("sensors", "sensors", "temp1_input,temp2_input")
+    cfg["sensors"] = [s.strip() for s in sensors.split(",") if s.strip()]
+
+    def parse_curve(section, prefix):
+        steps = []
+        raw = get("curves", f"{prefix}_steps", "")
+        for pair in raw.split(","):
+            pair = pair.strip()
+            if not pair:
+                continue
+            bound, pwm = pair.split(":")
+            steps.append((float(bound), int(pwm)))
+        steps.append((float("inf"), int(get("curves", f"{prefix}_max_pwm",
+                                               "255"))))
+        return steps
+
+    cfg["card_curve"] = parse_curve("curves", "card")
+    cfg["bg_curve"] = parse_curve("curves", "background")
+    cfg["all_channels"] = sorted(cfg["fans"].values())
+
+    # --- validation: fail fast with a readable error ---
+    for slot, fans in cfg["slots"].items():
+        for fan, _ in fans:
+            if fan not in cfg["fans"]:
+                raise SystemExit(
+                    f"octofan-control: slot {slot} references unknown fan "
+                    f"{fan} (not in [fans])")
+    for slot in cfg["card_slots"]:
+        if slot not in cfg["slots"]:
+            raise SystemExit(
+                f"octofan-control: card slot {slot} not defined in [slots]")
+    for key, curve in (("card", cfg["card_curve"]),
+                       ("background", cfg["bg_curve"])):
+        if len(curve) < 2:
+            raise SystemExit(f"octofan-control: curve {key} needs steps")
+        for (b1, p1), (b2, p2) in zip(curve, curve[1:]):
+            if not b1 < b2 or not 0 <= p1 <= 255:
+                raise SystemExit(
+                    f"octofan-control: curve {key} malformed: {curve}")
+    return cfg
+
+
+def gpu_hwmons(cfg):
+    out = []
+    for d in glob.glob("/sys/class/hwmon/hwmon*"):
+        try:
+            if open(d + "/name").read().strip() in cfg["hwmon_names"]:
+                out.append(d)
+        except OSError:
+            pass
+    return out
+
+
+def read_max_temp(cfg):
+    t = None
+    for d in gpu_hwmons(cfg):
+        for sensor in cfg["sensors"]:
+            try:
+                v = int(open(f"{d}/{sensor}").read()) / 1000.0
+                t = v if t is None else max(t, v)
+            except (OSError, ValueError):
+                pass
+    return t
+
+
+def set_fan(cfg, channel, pwm):
+    subprocess.run([cfg["cli"], "-f", str(channel), "-v", str(pwm)],
+                   capture_output=True, timeout=10)
+
+
+def curve_index(curve, temp):
+    for i, (bound, _) in enumerate(curve):
+        if temp <= bound:
+            return i
+    return len(curve) - 1
+
+
+def target_pwm(curve, temp, current, hyst):
+    """Ramp up immediately; require a hysteresis drop below the next-lower
+    boundary before stepping down (anti-flap)."""
+    wanted = curve_index(curve, temp)
+    if current is None:
+        return curve[wanted][1]
+    try:
+        current_i = next(i for i, (_, pwm) in enumerate(curve)
+                         if pwm == current)
+    except StopIteration:
+        return curve[wanted][1]
+    if wanted >= current_i:
+        return curve[wanted][1]
+    lower_bound = curve[current_i - 1][0]
+    if temp <= lower_bound - hyst:
+        return curve[current_i - 1][1]
+    return current
+
+
+def occupied_fans(cfg):
+    fans = set()
+    for slot in cfg["card_slots"]:
+        for fan, _ in cfg["slots"][slot]:
+            fans.add(fan)
+    return fans
+
+
+def compute_targets(cfg, card_pwm, bg_pwm):
+    """Per-channel PWM: background curve everywhere, overridden by the
+    card curve (scaled by slot duty, floored at floor_pwm) on fans that
+    cover occupied slots."""
+    targets = {ch: bg_pwm for ch in cfg["all_channels"]}
+    for slot in cfg["card_slots"]:
+        for fan, duty in cfg["slots"][slot]:
+            ch = cfg["fans"][fan]
+            scaled = max(cfg["floor"], int(round(card_pwm * duty)))
+            targets[ch] = max(targets[ch], scaled)
+    return targets
+
+
+def run_loop(cfg, read_temp=None, set_fan_fn=None, sleep_fn=time.sleep,
+             iterations=None):
+    """Main control loop. read_temp/set_fan_fn/sleep_fn are injectable for
+    tests; iterations limits polls (None = run forever)."""
+    if read_temp is None:
+        read_temp = lambda: read_max_temp(cfg)  # noqa: E731
+    if set_fan_fn is None:
+        set_fan_fn = lambda ch, pwm: set_fan(cfg, ch, pwm)  # noqa: E731
+    card_cur = None
+    bg_cur = None
+    misses = 0
+    failed_safe = False
+    last_targets = None
+    polls = 0
+    while iterations is None or polls < iterations:
+        polls += 1
+        temp = read_temp()
+        if temp is None:
+            misses += 1
+            if misses >= 3 and not failed_safe:
+                print("no GPU temp for 3 polls -> fail-safe full speed",
+                      flush=True)
+                for ch in cfg["all_channels"]:
+                    set_fan_fn(ch, 255)
+                failed_safe = True
+                last_targets = None
+            sleep_fn(cfg["poll"])
+            continue
+        misses = 0
+        if failed_safe:
+            print("temps recovered, resuming zone curves", flush=True)
+            failed_safe = False
+            card_cur = None
+            bg_cur = None
+            last_targets = None
+        pwm = target_pwm(cfg["card_curve"], temp, card_cur, cfg["hyst"])
+        card_cur = pwm
+        bpwm = target_pwm(cfg["bg_curve"], temp, bg_cur, cfg["hyst"])
+        bg_cur = bpwm
+        targets = compute_targets(cfg, pwm, bpwm)
+        for ch in sorted(targets):  # re-assert every poll
+            set_fan_fn(ch, targets[ch])
+        if targets != last_targets:
+            desc = ", ".join(f"ch{c}:{p}" for c, p in sorted(targets.items()))
+            print(f"{temp:.0f}C card PWM {pwm} bg PWM {bpwm} -> {desc}",
+                  flush=True)
+            last_targets = targets
+        sleep_fn(cfg["poll"])
+
+
+def main(argv):
+    path = argv[1] if len(argv) > 1 else DEFAULT_CONF
+    cfg = load_config(path)
+    print(f"octofan-control: {len(cfg['all_channels'])} fans "
+          f"{cfg['fans']}, card slots {cfg['card_slots']}", flush=True)
+    run_loop(cfg)
+
+
+if __name__ == "__main__":
+    main(sys.argv)

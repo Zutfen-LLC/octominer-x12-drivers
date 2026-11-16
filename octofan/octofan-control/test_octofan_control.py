@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from importlib.machinery import SourceFileLoader
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 oc = SourceFileLoader(
@@ -73,6 +74,27 @@ class TestConfig(unittest.TestCase):
                                        "FAN4": 2, "FAN5": 0})
         self.assertEqual(len(cfg["all_channels"]), 5)
         self.assertIn("DB1", cfg["slots"])
+
+    def test_terminal_curve_pwm_out_of_range_is_rejected(self):
+        bad = CONF.replace("card_max_pwm = 255", "card_max_pwm = 256")
+        with tempfile.NamedTemporaryFile("w", suffix=".conf", delete=False,
+                                         dir=os.environ.get("TMPDIR")) as f:
+            f.write(bad)
+            path = f.name
+        try:
+            with self.assertRaises(SystemExit):
+                oc.load_config(path)
+        finally:
+            os.unlink(path)
+
+    def test_normal_auto_dispatch_rejects_synthetic_sysfs_root(self):
+        cfg = make_cfg()
+        cfg.update({"mode": "auto", "sysfs_root": "/synthetic/sys"})
+        with mock.patch.object(oc, "load_config", return_value=cfg), \
+             mock.patch.object(oc, "run_auto_loop") as loop:
+            with self.assertRaises(SystemExit):
+                oc.main(["octofan-control", "config.ini"])
+            loop.assert_not_called()
 
     def test_unknown_fan_in_slot_rejected(self):
         bad = CONF.replace("DB1 = FAN4", "DB1 = FAN9")
@@ -149,6 +171,156 @@ class TestTargets(unittest.TestCase):
         self.assertEqual(t, {8: 153, 6: 153, 4: 153, 2: 255, 0: 153})
 
 
+    def test_auto_slot_targets_are_independent_and_shared_fans_take_max(self):
+        cfg = make_cfg()
+        snapshot = {"slot_temps": {"DB1": 55.0, "DB10": 45.0}, "global_temp": 55.0}
+        targets, slot_pwms, _ = oc.auto_targets(cfg, snapshot, {}, None)
+        self.assertEqual(slot_pwms["DB1"], 102)
+        self.assertEqual(slot_pwms["DB10"], 64)
+        self.assertEqual(targets[2], 102)
+        self.assertEqual(targets[8], 64)
+
+    def test_writer_nonzero_is_reported_after_trying_every_channel(self):
+        cfg = make_cfg()
+        attempted = []
+        def writer(ch, pwm):
+            attempted.append(ch)
+            return ch != 4
+        self.assertFalse(oc._write_round(cfg, {ch: 100 for ch in cfg["all_channels"]}, writer))
+        self.assertEqual(sorted(attempted), cfg["all_channels"])
+
+
+class TestAutoStateMachine(unittest.TestCase):
+    def setUp(self):
+        self.cfg = make_cfg()
+        self.cfg.update({"mode": "auto", "poll": 0.01})
+
+    @staticmethod
+    def snapshot(temps, fault=None, topology=None, endpoints=None):
+        endpoints = endpoints or [
+            {"bdf": "0000:01:00.0", "vendor": 1, "device": 2,
+             "subsystem_vendor": 3, "subsystem_device": 4,
+             "root": ("0x1234", "0x5678", 1), "slot": "DB1"},
+            {"bdf": "0000:02:00.0", "vendor": 1, "device": 2,
+             "subsystem_vendor": 3, "subsystem_device": 4,
+             "root": ("0x1234", "0x5678", 2), "slot": "DB10"},
+        ]
+        sensors = [fault] if fault else []
+        top = [topology] if topology else []
+        vals = list(temps.values())
+        return {"endpoints": endpoints, "excluded": [], "slot_temps": temps,
+                "global_temp": max(vals) if vals else None,
+                "faults": top + sensors, "topology_faults": top,
+                "sensor_faults": sensors}
+
+    def run_trace(self, snapshots, write_results=None):
+        seq = iter(snapshots)
+        writes = []
+        results = iter(write_results or [])
+        def writer(ch, pwm):
+            writes.append((ch, pwm))
+            result = next(results, True)
+            if result is False:
+                return False
+            return True
+        original = oc.auto_snapshot
+        oc.auto_snapshot = lambda cfg: next(seq)
+        try:
+            oc.run_auto_loop(self.cfg, writer=writer, iterations=len(snapshots),
+                             sleep_fn=lambda _: None)
+        finally:
+            oc.auto_snapshot = original
+        return [dict(writes[i:i + 5]) for i in range(0, len(writes), 5)]
+
+    def test_sensor_fault_grace_holds_downward_targets_then_reasserts_full_speed(self):
+        traces = self.run_trace([
+            self.snapshot({"DB1": 45, "DB10": 45}),
+            self.snapshot({"DB1": 45, "DB10": 45}),
+            self.snapshot({"DB1": 45, "DB10": 45}),
+            self.snapshot({"DB1": 85}, fault="DB10 sensor missing"),
+            self.snapshot({"DB1": 85}, fault="DB10 sensor missing"),
+            self.snapshot({"DB1": 45}, fault="DB10 sensor missing"),
+            self.snapshot({"DB1": 45}, fault="DB10 sensor missing"),
+        ])
+        # DB1 is FAN4/channel 2; healthy DB1 may ramp upward, but not down.
+        self.assertEqual(traces[3][2], 230)
+        self.assertEqual(traces[4][2], 230)
+        self.assertTrue(all(p == 255 for row in traces[5:] for p in row.values()))
+
+    def test_startup_requires_two_complete_snapshots_before_reduced_control(self):
+        traces = self.run_trace([self.snapshot({"DB1": 45, "DB10": 45})] * 3)
+        self.assertTrue(all(p == 255 for p in traces[0].values()))
+        self.assertTrue(all(p == 255 for p in traces[1].values()))
+        self.assertLess(max(traces[2].values()), 255)
+
+    def test_topology_fault_is_immediate_and_reasserted(self):
+        traces = self.run_trace([
+            self.snapshot({"DB1": 45, "DB10": 45}),
+            self.snapshot({"DB1": 45, "DB10": 45}),
+            self.snapshot({"DB1": 45, "DB10": 45}, topology="unknown topology"),
+            self.snapshot({"DB1": 45, "DB10": 45}, topology="unknown topology"),
+        ])
+        self.assertTrue(all(p == 255 for row in traces[2:] for p in row.values()))
+
+    def test_changed_or_missing_enrolled_identity_is_fatal(self):
+        good = self.snapshot({"DB1": 45, "DB10": 45})
+        changed = self.snapshot({"DB1": 45}, endpoints=[good["endpoints"][0]])
+        traces = self.run_trace([good, good, changed, good, good, good])
+        self.assertTrue(all(p == 255 for p in traces[2].values()))
+        self.assertTrue(all(p == 255 for p in traces[3].values()))
+        self.assertTrue(all(p == 255 for p in traces[4].values()))
+        self.assertLess(max(traces[5].values()), 255)
+
+    def test_inspection_converts_reader_exception_to_safe_plan(self):
+        self.cfg["mode"] = "auto"
+        self.cfg["all_channels"] = [0, 2]
+        with mock.patch.object(oc, "auto_snapshot", side_effect=OSError("reader offline")):
+            report = oc.inspect(self.cfg)
+        self.assertIn("reader offline", report["faults"][0])
+        self.assertEqual(report["fan_targets"], {"0": 255, "2": 255})
+
+    def test_writer_failure_falls_back_and_stays_latched_until_confirmed(self):
+        good = self.snapshot({"DB1": 45, "DB10": 45})
+        sequence = iter([False] + [True] * 100)
+        writes = []
+        def writer(ch, pwm):
+            writes.append((ch, pwm))
+            return next(sequence)
+        original = oc.auto_snapshot
+        oc.auto_snapshot = lambda cfg: good
+        try:
+            oc.run_auto_loop(self.cfg, writer=writer, iterations=5,
+                             sleep_fn=lambda _: None)
+        finally:
+            oc.auto_snapshot = original
+        rows = [writes[i:i + 5] for i in range(0, len(writes), 5)]
+        self.assertEqual(len(rows), 6)  # failed initial round + immediate fallback + 4 polls
+        self.assertEqual([p for _, p in rows[0]], [255] * 5)
+        self.assertTrue(all(p == 255 for row in rows[:3] for _, p in row))
+        self.assertTrue(any(p < 255 for row in rows[3:] for _, p in row))
+
+    def test_set_fan_checks_command_failure_and_timeout_is_caught_by_round(self):
+        cfg = self.cfg
+        attempted = []
+        def writer(ch, pwm):
+            attempted.append(ch)
+            if ch == 8:
+                raise oc.subprocess.TimeoutExpired("fan", 10)
+            if ch == 6:
+                raise OSError("offline")
+            return True
+        self.assertFalse(oc._write_round(cfg, {ch: 100 for ch in cfg["all_channels"]}, writer))
+        self.assertEqual(sorted(attempted), cfg["all_channels"])
+
+    def test_manual_missing_temperature_reasserts_full_speed_each_poll(self):
+        cfg = make_cfg()
+        writes = []
+        oc.run_loop(cfg, read_temp=lambda: None,
+                    set_fan_fn=lambda ch, pwm: writes.append((ch, pwm)),
+                    sleep_fn=lambda _: None, iterations=6)
+        self.assertEqual(sum(p == 255 for _, p in writes), 20)
+
+
 class TestLoop(unittest.TestCase):
     def test_reassert_and_ramp(self):
         cfg = make_cfg()
@@ -174,9 +346,9 @@ class TestLoop(unittest.TestCase):
                     set_fan_fn=lambda ch, pwm: writes.append((ch, pwm)),
                     sleep_fn=lambda s: None,
                     iterations=4)
-        # 3rd poll trips fail-safe: everything to 255 exactly once
+        # Once the third miss trips fail-safe, every later miss reasserts it.
         full = [p for ch, p in writes if p == 255]
-        self.assertEqual(len(full), 5)
+        self.assertEqual(len(full), 10)
 
     def test_failsafe_recovery(self):
         cfg = make_cfg()

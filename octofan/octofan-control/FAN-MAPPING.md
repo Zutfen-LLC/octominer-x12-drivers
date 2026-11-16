@@ -1,68 +1,97 @@
-# Fan mapping procedure (Octominer X12 / MINERDUDE 12XTREME)
+# Fan and physical-slot mapping (Octominer X12 / MINERDUDE 12XTREME)
 
-Rigs have arrived with fans on non-stock headers, and the controller has
-quirks that make guessing expensive. Verify every rig once with this
-procedure before trusting any [fans]/[slots] config.
+Verify the electrical wiring and physical coverage before trusting a profile.
+The calibrated profile is evidence from one rig, not proof that all chassis,
+backplanes, BIOS revisions or fan replacements behave identically.
 
-## Conventions (the numbering landmine)
+## Conventions
 
-* Case fans count **left to right** facing the rig: FAN1 leftmost.
-* PCIe slots count **right to left**: slot 1 is rightmost. Motherboard
-  slots are MB1/MB2 (under FAN5's end); daughterboard slots DB1-DB10
-  continue leftward (DB1 rightmost, FAN4's zone).
-* Stock 12XTREME fan headers: FAN1=ch8, FAN2=ch6, FAN3=ch4, FAN4=ch2,
-  FAN5=ch0; odd channels empty.
+- Case fans count left to right facing the rig: FAN1 is leftmost.
+- Slots count right to left: MB1, MB2, then DB1..DB10.
+- Confirmed wiring: FAN1=ch8, FAN2=ch6, FAN3=ch4, FAN4=ch2, FAN5=ch0.
+  Odd channels are physically empty on the calibrated rig.
 
-## Controller quirks
+## Controller quirks and safety boundaries
 
-* Writing PWM to an even channel mirrors the value to its odd pair
-  (write ch4 -> ch4+ch5). A second fan spinning during a blip is usually
-  this, not a Y-splitter; check the adjacent odd channel's tach.
-* curPWM is what the controller holds; a manual write persists until
-  something overwrites it. The daemon re-asserts every poll.
-* EEPROM default PWM (defPWM) covers pre-daemon boot airflow: keep ~100.
-* Hardware watchdog should be disabled (`-w 0 -v 0`); the daemon's
-  no-temperature fail-safe replaces it.
+- An even-channel PWM write also changes its odd partner. A mirrored curPWM is
+  not proof of a second physical fan; verify tach and operator observations.
+- Runtime PWM is not RPM percentage. The five measured low-duty responses differ;
+  lowering a number can stop one fan without slowing the others appreciably.
+- The daemon reasserts targets every poll, so an ad-hoc write during normal
+  operation is transient. Do not fight the daemon with a separate controller.
+- Keep adequate EEPROM startup airflow before any GPU boots. The accepted quiet
+  startup PWM38 was specific to the self-cooled Quadro enumeration exercise;
+  restore startup PWM100 and the appropriate card curve before passive V340L use.
+- Software temperature-loss fail-safe does not replace hardware watchdog coverage
+  for a dead daemon or unavailable controller. This feature does not arm or
+  disable a watchdog. Do not disable an existing watchdog as routine commissioning.
+- PSU fans and the GPU's own fan controller are separate from these case-fan zones.
 
-## Step 1: electrical blip sweep (no human needed)
+## 1. Electrical and physical fan verification
 
-Stop the daemon, zero all channels, then blip each channel to 255 alone
-and read tach. Channels with RPM have a fan; channels without are empty.
+Use a planned, idle commissioning window and an operator at the rig. Preserve a
+known safe airflow baseline, monitor actual GPU temperatures, use a bounded test
+with an independent restore guard, and restore/verify the daemon after testing.
+Prefer briefly boosting one channel over that safe baseline rather than stopping
+all fans. Do not run an unattended zero-all-channel sweep on installed GPUs;
+particularly do not remove case airflow from passive cards.
 
-```bash
-sudo systemctl stop octofan-control
-for i in $(seq 0 11); do sudo fan_controller_cli -f $i -v 0; done
-sleep 5
-for c in $(seq 0 11); do
-  sudo fan_controller_cli -f $c -v 255; sleep 4
-  rpm=$(sudo fan_controller_cli -h | awk -v ch=$c '$1==ch {print $4}')
-  echo "ch$c -> $rpm RPM"
-  sudo fan_controller_cli -f $c -v 0; sleep 2
-done
-sudo systemctl start octofan-control
+Record channel tach responses, mirrored partner channels and the operator's
+physical fan label. Electrical tach alone does not establish left/right position
+or prove a zero-RPM reading is physical standstill.
+
+If fan wiring has not changed since its operator-confirmed mapping, retain that
+mapping rather than re-running disruptive blips for every software update.
+
+## 2. Slot coverage and calibrated root identity
+
+The versioned profile `profiles/minerdude-12xtreme.json` contains the twelve
+operator-labelled root-port identities and the following physical coverage:
+
+| Slot | Covering fan(s) |
+|---|---|
+| MB1, MB2 | FAN5 |
+| DB1, DB2 | FAN4 |
+| DB3 | FAN3 + FAN4, each at 0.75 scale |
+| DB4, DB5 | FAN3 |
+| DB6 | FAN2 + FAN3, each at 0.75 scale |
+| DB7, DB8 | FAN2 |
+| DB9 | FAN1 + FAN2, each at 0.75 scale |
+| DB10 | FAN1 |
+
+Manual mode needs an explicit `[cards] slots` list. Automatic mode instead maps
+all observed GPU endpoints through their actual motherboard root port. It uses
+root vendor/device plus PCIe LinkCap hardware Port#, validated as a Root Port.
+
+Do not use BDF alone: DB1 and DB2 exposed the same root BDF and complete GPU bus
+paths in separate boots while having different hardware root IDs/port numbers.
+Keep the full root tuple; distinguish a card-internal switch from the motherboard
+root and group multiple GPU dies behind that root as one occupied slot.
+
+The retained twelve samples prove single-card positional discovery. Validate
+simultaneous populations separately, since bus enumeration and operational
+cooling may change with several cards installed. Before moving a physical card,
+power down, verify it has stopped and disconnect mains; a remotely accepted
+shutdown command is not proof of electrical isolation.
+
+## 3. Read-only commissioning and controlled activation
+
+Follow the candidate-config workflow in `README.md`. Select automatic mode and
+the exact profile explicitly; profile wiring/coverage must agree with the INI.
+Inspect before touching the running controller:
+
+```sh
+sudo /usr/local/sbin/octofan-control --inspect /root/octofan-control.candidate.conf
 ```
 
-## Step 2: physical position pass (human at the rig)
+Check every GPU endpoint/die, root/physical slot, hwmon association, exclusions,
+slot temperature and predicted channel target. A missing die is not satisfied by
+its healthy sibling. Unknown or ambiguous placement must produce a fault and a
+full-speed plan, never background-only cooling.
 
-Blip each occupied channel one at a time and have the operator name the
-physical fan that spins. This binds channel -> physical position. With
-fans on stock headers the expected order (left to right) is ch8, ch6,
-ch4, ch2, ch0; a blip run in that order should spin the fans smoothly
-left to right.
-
-## Step 3: slot coverage
-
-Use the coverage table above (it is chassis geometry, identical across
-stock 12XTREME builds) and record which slots hold cards. Write both
-into /etc/octofan-control.conf ([fans], [slots] if non-stock, [cards]).
-
-## Step 4: verify
-
-```bash
-sudo systemctl restart octofan-control
-journalctl -u octofan-control -n 5   # expect one line per target change
-sudo fan_controller_cli -h           # curPWM matches journal targets
-```
-
-Under load, only fans covering occupied slots should ramp; the rest hold
-the background floor.
+After an authorized activation, verify service health and journal, then read
+`fan_controller_cli -h`: actual curPWM/tachs must agree with requested targets.
+Under ordinary loads, zones should follow their own GPUs; shared fans take the
+maximum request. Background fans can still ramp deliberately at the configured
+high-temperature thresholds. Verify real loaded temperatures and fault recovery
+before declaring any GPU population qualified.

@@ -1,0 +1,31 @@
+name: octofan-control
+on:
+  push:
+    paths:
+      - 'octofan/octofan-control/**'
+      - '.github/workflows/octofan-control.yml'
+  pull_request:
+    paths:
+      - 'octofan/octofan-control/**'
+      - '.github/workflows/octofan-control.yml'
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Configure test scratch directory
+        run: printf 'TMPDIR=%s\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+      - run: python3 -m unittest discover -v
+        working-directory: octofan/octofan-control
+      - run: python3 -m py_compile octofan-control octofan_topology.py
+        working-directory: octofan/octofan-control
+      - run: bash -n install.sh
+        working-directory: octofan/octofan-control

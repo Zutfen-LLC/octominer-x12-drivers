@@ -37,9 +37,14 @@ Usage: octofan-control [config-path]   (run as root via systemd)
 """
 import configparser
 import glob
+import json
+import math
+import os
+import re
 import subprocess
 import sys
 import time
+import octofan_topology
 
 DEFAULT_CONF = "/etc/octofan-control.conf"
 
@@ -67,7 +72,23 @@ def load_config(path):
         "sensors": [],
         "card_curve": [],
         "bg_curve": [],
+        "mode": get("controller", "mode", "manual").strip().lower(),
+        "profile": get("automatic", "profile", ""),
+        "sysfs_root": get("automatic", "sysfs_root", "/sys"),
     }
+    if cfg["mode"] not in ("manual", "auto"):
+        raise SystemExit("octofan-control: controller mode must be manual or auto")
+    if cfg["mode"] == "auto":
+        if not cfg["profile"]:
+            raise SystemExit("octofan-control: auto mode requires explicit [automatic] profile")
+        profile_path = cfg["profile"]
+        if not os.path.isabs(profile_path):
+            profile_path = os.path.join(os.path.dirname(os.path.abspath(path)), profile_path)
+        cfg["profile"] = profile_path
+        try:
+            cfg["profile_data"] = octofan_topology.load_profile(profile_path)
+        except octofan_topology.TopologyError as exc:
+            raise SystemExit(f"octofan-control: {exc}") from exc
 
     for name, ch in cp.items("fans"):
         cfg["fans"][name.strip()] = int(ch)
@@ -129,6 +150,40 @@ def load_config(path):
             if not b1 < b2 or not 0 <= p1 <= 255:
                 raise SystemExit(
                     f"octofan-control: curve {key} malformed: {curve}")
+    if cfg["mode"] == "auto":
+        profile = cfg["profile_data"]
+        if cfg["fans"] != profile["fans"]:
+            raise SystemExit("octofan-control: profile fan channels disagree with [fans]")
+        for entry in profile["slots"]:
+            mapped = sorted((x["fan"], float(x["scale"])) for x in entry["coverage"])
+            configured = sorted(cfg["slots"].get(entry["slot"], []))
+            if mapped != configured:
+                raise SystemExit(f"octofan-control: profile coverage disagrees for {entry['slot']}")
+    if len(set(cfg["fans"].values())) != len(cfg["fans"]) or any(not 0 <= c <= 11 for c in cfg["fans"].values()):
+        raise SystemExit("octofan-control: fan channels must be unique in 0..11")
+    if (not math.isfinite(cfg["poll"]) or not 0 < cfg["poll"] <= 60 or
+            not math.isfinite(cfg["hyst"]) or not 0 <= cfg["hyst"] <= 20 or
+            not 0 <= cfg["floor"] <= 255):
+        raise SystemExit("octofan-control: invalid timing, hysteresis, or floor")
+    for slot, coverage in cfg["slots"].items():
+        if not coverage or len({fan for fan, _ in coverage}) != len(coverage):
+            raise SystemExit(f"octofan-control: empty or duplicate fan coverage for {slot}")
+        for fan, scale in coverage:
+            if not math.isfinite(scale) or not 0 < scale <= 1:
+                raise SystemExit(f"octofan-control: invalid coverage scale for {slot}/{fan}")
+    if not cfg["fans"] or not cfg["hwmon_names"] or not cfg["sensors"]:
+        raise SystemExit("octofan-control: fans, hwmon_names, and sensors must be nonempty")
+    if len(set(cfg["card_slots"])) != len(cfg["card_slots"]):
+        raise SystemExit("octofan-control: duplicate card slot")
+    if any(not name or "/" in name or name in (".", "..") for name in cfg["hwmon_names"]):
+        raise SystemExit("octofan-control: invalid hwmon name")
+    if any(not re.fullmatch(r"temp[0-9]+_input", sensor) for sensor in cfg["sensors"]):
+        raise SystemExit("octofan-control: sensor names must be tempN_input")
+    for key, curve in (("card", cfg["card_curve"]), ("background", cfg["bg_curve"])):
+        if (len(curve) < 2 or any(not math.isfinite(b) or not 0 <= p <= 255 for b, p in curve[:-1]) or
+                not 0 <= curve[-1][1] <= 255 or
+                any(p2 < p1 for (_, p1), (_, p2) in zip(curve, curve[1:]))):
+            raise SystemExit(f"octofan-control: curve {key} boundaries/PWM must be finite and PWM nondecreasing in 0..255")
     return cfg
 
 
@@ -156,8 +211,12 @@ def read_max_temp(cfg):
 
 
 def set_fan(cfg, channel, pwm):
-    subprocess.run([cfg["cli"], "-f", str(channel), "-v", str(pwm)],
-                   capture_output=True, timeout=10)
+    result = subprocess.run([cfg["cli"], "-f", str(channel), "-v", str(pwm)],
+                           capture_output=True, timeout=10)
+    if result.returncode != 0:
+        raise subprocess.CalledProcessError(result.returncode, result.args,
+                                            output=result.stdout, stderr=result.stderr)
+    return result
 
 
 def curve_index(curve, temp):
@@ -219,20 +278,42 @@ def run_loop(cfg, read_temp=None, set_fan_fn=None, sleep_fn=time.sleep,
     bg_cur = None
     misses = 0
     failed_safe = False
+    actuation_fault = False
+    actuation_recovery = 0
     last_targets = None
     polls = 0
     while iterations is None or polls < iterations:
         polls += 1
-        temp = read_temp()
+        try:
+            temp = read_temp()
+        except Exception as exc:
+            print(f"octofan-control: temperature read failed: {exc}", flush=True)
+            temp = None
+        if actuation_fault:
+            full = {ch: 255 for ch in cfg["all_channels"]}
+            round_ok = _write_round(cfg, full, set_fan_fn)
+            if round_ok and temp is not None:
+                actuation_recovery += 1
+                if actuation_recovery >= 2:
+                    actuation_fault = False
+                    failed_safe = False
+                    card_cur, bg_cur = None, None
+                    actuation_recovery = 0
+            else:
+                actuation_recovery = 0
+            sleep_fn(cfg["poll"])
+            continue
         if temp is None:
             misses += 1
-            if misses >= 3 and not failed_safe:
-                print("no GPU temp for 3 polls -> fail-safe full speed",
-                      flush=True)
-                for ch in cfg["all_channels"]:
-                    set_fan_fn(ch, 255)
+            if misses >= 3:
+                print("no GPU temp for 3 polls -> fail-safe full speed", flush=True)
+                targets = {ch: 255 for ch in cfg["all_channels"]}
+                if not _write_round(cfg, targets, set_fan_fn):
+                    actuation_fault = True
+                    actuation_recovery = 0
+                    print("octofan-control: full-speed write failed; controller may be unreachable", flush=True)
                 failed_safe = True
-                last_targets = None
+                last_targets = targets
             sleep_fn(cfg["poll"])
             continue
         misses = 0
@@ -247,9 +328,15 @@ def run_loop(cfg, read_temp=None, set_fan_fn=None, sleep_fn=time.sleep,
         bpwm = target_pwm(cfg["bg_curve"], temp, bg_cur, cfg["hyst"])
         bg_cur = bpwm
         targets = compute_targets(cfg, pwm, bpwm)
-        for ch in sorted(targets):  # re-assert every poll
-            set_fan_fn(ch, targets[ch])
-        if targets != last_targets:
+        if not _write_round(cfg, targets, set_fan_fn):
+            failed_safe = True
+            actuation_fault = True
+            actuation_recovery = 0
+            safe_targets = {ch: 255 for ch in cfg["all_channels"]}
+            _write_round(cfg, safe_targets, set_fan_fn)
+            last_targets = safe_targets
+            print("octofan-control: write failed; attempted all-fan full-speed fallback; controller may be unreachable", flush=True)
+        elif targets != last_targets:
             desc = ", ".join(f"ch{c}:{p}" for c, p in sorted(targets.items()))
             print(f"{temp:.0f}C card PWM {pwm} bg PWM {bpwm} -> {desc}",
                   flush=True)
@@ -257,12 +344,182 @@ def run_loop(cfg, read_temp=None, set_fan_fn=None, sleep_fn=time.sleep,
         sleep_fn(cfg["poll"])
 
 
+def auto_snapshot(cfg):
+    """Delegate stateless topology/sensor collection to the shared reader."""
+    return octofan_topology.read_snapshot(cfg)
+
+
+def auto_targets(cfg, snapshot, slot_cur, bg_cur):
+    temps = snapshot["slot_temps"]
+    background_temp = snapshot["global_temp"]
+    bg_pwm = target_pwm(cfg["bg_curve"], background_temp, bg_cur, cfg["hyst"]) if background_temp is not None else cfg["floor"]
+    targets = {ch: max(cfg["floor"], bg_pwm) for ch in cfg["all_channels"]}
+    card_pwms = {}
+    for slot, temp in temps.items():
+        pwm = target_pwm(cfg["card_curve"], temp, slot_cur.get(slot), cfg["hyst"])
+        card_pwms[slot] = pwm
+        for fan, scale in cfg["slots"].get(slot, []):
+            ch = cfg["fans"][fan]
+            targets[ch] = max(targets[ch], int(round(pwm * scale)), cfg["floor"])
+    return targets, card_pwms, bg_pwm
+
+
+def _write_round(cfg, targets, writer):
+    ok = True
+    for channel in cfg["all_channels"]:
+        try:
+            result = writer(channel, targets[channel])
+            if result is False or (hasattr(result, "returncode") and result.returncode != 0):
+                ok = False
+        except (OSError, subprocess.SubprocessError, TimeoutError):
+            ok = False
+    return ok
+
+
+def run_auto_loop(cfg, writer=None, iterations=None, sleep_fn=time.sleep):
+    """Conservative auto controller; all state is process-lifetime local."""
+    if writer is None:
+        writer = lambda ch, pwm: set_fan(cfg, ch, pwm)
+    enrolled = {}
+    slot_cur, bg_cur = {}, None
+    healthy_streak = fault_streak = 0
+    safe_latched = True  # require two complete startup snapshots
+    actuation_fault = False
+    last_targets = {ch: 255 for ch in cfg["all_channels"]}
+    last_fault_key = None
+    poll = 0
+
+    def fingerprint(endpoint):
+        return (endpoint["bdf"], endpoint["vendor"], endpoint["device"],
+                endpoint["subsystem_vendor"], endpoint["subsystem_device"],
+                tuple(endpoint["root"]))
+
+    while iterations is None or poll < iterations:
+        poll += 1
+        try:
+            snapshot = auto_snapshot(cfg)
+            endpoints = snapshot.get("endpoints", [])
+            faults = list(snapshot.get("faults", []))
+            topology_faults = list(snapshot.get("topology_faults", []))
+            sensor_faults = list(snapshot.get("sensor_faults", []))
+            now = {e["bdf"]: fingerprint(e) for e in endpoints}
+        except Exception as exc:
+            endpoints = []
+            snapshot = {"endpoints": [], "slot_temps": {}, "global_temp": None}
+            faults, topology_faults, sensor_faults = [f"snapshot read failed: {exc}"], [], ["snapshot read failed"]
+            now = {}
+
+        inventory_faults = []
+        for bdf, expected in enrolled.items():
+            if now.get(bdf) != expected:
+                inventory_faults.append(f"enrolled endpoint missing or changed: {bdf}")
+        complete_snapshot = bool(endpoints) and not faults and not inventory_faults
+        if complete_snapshot:
+            for bdf, fp in now.items():
+                enrolled.setdefault(bdf, fp)
+            healthy_streak += 1
+            fault_streak = 0
+        else:
+            healthy_streak = 0
+            fault_streak += 1
+
+        immediate = bool(topology_faults or inventory_faults)
+        if immediate:
+            safe_latched = True
+        if fault_streak >= 3:
+            safe_latched = True
+
+        recovering = safe_latched or actuation_fault
+        if recovering:
+            targets = {ch: 255 for ch in cfg["all_channels"]}
+        else:
+            targets, card_pwms, next_bg = auto_targets(cfg, snapshot, slot_cur, bg_cur)
+            if not complete_snapshot:
+                # Grace: never lower a channel, while fresh hot readings can raise it.
+                targets = {ch: max(targets[ch], last_targets[ch]) for ch in targets}
+                for slot, pwm in card_pwms.items():
+                    if slot_cur.get(slot) is None or pwm >= slot_cur[slot]:
+                        slot_cur[slot] = pwm
+                if bg_cur is None or next_bg >= bg_cur:
+                    bg_cur = next_bg
+            else:
+                slot_cur.update(card_pwms)
+                bg_cur = next_bg
+
+        prior_targets = dict(last_targets)
+        success = _write_round(cfg, targets, writer)
+        if not success:
+            actuation_fault = True
+            safe_latched = True
+            retry_ok = _write_round(cfg, {ch: 255 for ch in cfg["all_channels"]}, writer)
+            last_targets = {ch: 255 for ch in cfg["all_channels"]}
+            if retry_ok and complete_snapshot:
+                # Still require a later healthy poll before curves can resume.
+                healthy_streak = min(healthy_streak, 1)
+            print("octofan-control: actuation failed; attempted all-fan full-speed fallback; controller may be unreachable", flush=True)
+        else:
+            last_targets = dict(targets)
+            if actuation_fault:
+                # Clear only after two healthy snapshots and a successful full round.
+                if complete_snapshot and healthy_streak >= 2:
+                    actuation_fault = False
+                    safe_latched = False
+                    slot_cur, bg_cur = {}, None
+                else:
+                    safe_latched = True
+            elif safe_latched and complete_snapshot and healthy_streak >= 2 and not immediate:
+                # This poll remains full speed; reduced control begins next poll.
+                safe_latched = False
+                slot_cur, bg_cur = {}, None
+        fault_key = tuple(faults + inventory_faults)
+        if fault_key != last_fault_key:
+            if fault_key:
+                print("octofan-control: fault state entered: " + "; ".join(fault_key), flush=True)
+            elif last_fault_key:
+                print("octofan-control: sensor/topology fault state recovered", flush=True)
+            last_fault_key = fault_key
+        if faults or inventory_faults:
+            print("octofan-control: conservative fault: " + "; ".join(faults + inventory_faults), flush=True)
+        if targets != prior_targets and success:
+            desc = ", ".join(f"ch{ch}:{pwm}" for ch, pwm in sorted(targets.items()))
+            print("octofan-control: targets -> " + desc, flush=True)
+        sleep_fn(cfg["poll"])
+
+
+def inspect(cfg):
+    if cfg["mode"] != "auto":
+        return {"mode": "manual", "faults": ["inspection requires explicit auto mode"]}
+    try:
+        snapshot = auto_snapshot(cfg)
+    except Exception as exc:
+        snapshot = {"endpoints": [], "excluded": [], "slot_temps": {},
+                    "global_temp": None, "faults": [f"snapshot read failed: {exc}"],
+                    "topology_faults": [], "sensor_faults": ["snapshot read failed"]}
+    targets, _, _ = auto_targets(cfg, snapshot, {}, None)
+    if snapshot["faults"]:
+        targets = {ch: 255 for ch in cfg["all_channels"]}
+    return {"mode": "auto", "profile": cfg["profile"], **snapshot,
+            "fan_targets": {str(k): v for k, v in targets.items()}}
+
+
 def main(argv):
+    if len(argv) > 1 and argv[1] == "--inspect":
+        if len(argv) != 3:
+            raise SystemExit("usage: octofan-control --inspect CONFIG")
+        cfg = load_config(argv[2])
+        report = inspect(cfg)
+        print(json.dumps(report, sort_keys=True))
+        raise SystemExit(1 if report.get("faults") else 0)
     path = argv[1] if len(argv) > 1 else DEFAULT_CONF
     cfg = load_config(path)
+    if cfg["mode"] == "auto" and cfg["sysfs_root"] != "/sys":
+        raise SystemExit("octofan-control: synthetic sysfs_root is allowed only for --inspect")
     print(f"octofan-control: {len(cfg['all_channels'])} fans "
           f"{cfg['fans']}, card slots {cfg['card_slots']}", flush=True)
-    run_loop(cfg)
+    if cfg["mode"] == "auto":
+        run_auto_loop(cfg)
+    else:
+        run_loop(cfg)
 
 
 if __name__ == "__main__":

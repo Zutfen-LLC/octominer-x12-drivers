@@ -1,0 +1,274 @@
+{
+  "schema": "octominer-automatic-slot-profile-v1",
+  "profile_id": "MINERDUDE12XTREME-discovery-2026-11-16",
+  "board_identity": {
+    "vendor": "MINERDUDE",
+    "name": "12XTREME"
+  },
+  "numbering": "Slots right-to-left MB1/MB2/DB1..DB10; fans left-to-right FAN1..FAN5",
+  "roots": 12,
+  "fans": {
+    "FAN1": 8,
+    "FAN2": 6,
+    "FAN3": 4,
+    "FAN4": 2,
+    "FAN5": 0
+  },
+  "slots": [
+    {
+      "slot": "MB1",
+      "root": {
+        "vendor": "0x8086",
+        "device": "0x1901",
+        "port": 2
+      },
+      "coverage": [
+        {
+          "fan": "FAN5",
+          "scale": 1.0,
+          "channel": 0
+        }
+      ]
+    },
+    {
+      "slot": "MB2",
+      "root": {
+        "vendor": "0x8086",
+        "device": "0xa295",
+        "port": 6
+      },
+      "coverage": [
+        {
+          "fan": "FAN5",
+          "scale": 1.0,
+          "channel": 0
+        }
+      ]
+    },
+    {
+      "slot": "DB1",
+      "root": {
+        "vendor": "0x8086",
+        "device": "0xa29a",
+        "port": 11
+      },
+      "coverage": [
+        {
+          "fan": "FAN4",
+          "scale": 1.0,
+          "channel": 2
+        }
+      ]
+    },
+    {
+      "slot": "DB2",
+      "root": {
+        "vendor": "0x8086",
+        "device": "0xa29b",
+        "port": 12
+      },
+      "coverage": [
+        {
+          "fan": "FAN4",
+          "scale": 1.0,
+          "channel": 2
+        }
+      ]
+    },
+    {
+      "slot": "DB3",
+      "root": {
+        "vendor": "0x8086",
+        "device": "0xa299",
+        "port": 10
+      },
+      "coverage": [
+        {
+          "fan": "FAN3",
+          "scale": 0.75,
+          "channel": 4
+        },
+        {
+          "fan": "FAN4",
+          "scale": 0.75,
+          "channel": 2
+        }
+      ]
+    },
+    {
+      "slot": "DB4",
+      "root": {
+        "vendor": "0x8086",
+        "device": "0xa2ee",
+        "port": 24
+      },
+      "coverage": [
+        {
+          "fan": "FAN3",
+          "scale": 1.0,
+          "channel": 4
+        }
+      ]
+    },
+    {
+      "slot": "DB5",
+      "root": {
+        "vendor": "0x8086",
+        "device": "0xa298",
+        "port": 9
+      },
+      "coverage": [
+        {
+          "fan": "FAN3",
+          "scale": 1.0,
+          "channel": 4
+        }
+      ]
+    },
+    {
+      "slot": "DB6",
+      "root": {
+        "vendor": "0x8086",
+        "device": "0xa2ed",
+        "port": 23
+      },
+      "coverage": [
+        {
+          "fan": "FAN2",
+          "scale": 0.75,
+          "channel": 6
+        },
+        {
+          "fan": "FAN3",
+          "scale": 0.75,
+          "channel": 4
+        }
+      ]
+    },
+    {
+      "slot": "DB7",
+      "root": {
+        "vendor": "0x8086",
+        "device": "0xa297",
+        "port": 8
+      },
+      "coverage": [
+        {
+          "fan": "FAN2",
+          "scale": 1.0,
+          "channel": 6
+        }
+      ]
+    },
+    {
+      "slot": "DB8",
+      "root": {
+        "vendor": "0x8086",
+        "device": "0xa2ec",
+        "port": 22
+      },
+      "coverage": [
+        {
+          "fan": "FAN2",
+          "scale": 1.0,
+          "channel": 6
+        }
+      ]
+    },
+    {
+      "slot": "DB9",
+      "root": {
+        "vendor": "0x8086",
+        "device": "0xa296",
+        "port": 7
+      },
+      "coverage": [
+        {
+          "fan": "FAN1",
+          "scale": 0.75,
+          "channel": 8
+        },
+        {
+          "fan": "FAN2",
+          "scale": 0.75,
+          "channel": 6
+        }
+      ]
+    },
+    {
+      "slot": "DB10",
+      "root": {
+        "vendor": "0x8086",
+        "device": "0xa2eb",
+        "port": 21
+      },
+      "coverage": [
+        {
+          "fan": "FAN1",
+          "scale": 1.0,
+          "channel": 8
+        }
+      ]
+    }
+  ],
+  "source_observations": [
+    {
+      "file": "MB1-quadro.json",
+      "sha256": "e96fee41a1734c315d7a869202d26c8d9bbdd9a5e2d5cb3c08a30d44b6213083"
+    },
+    {
+      "file": "MB2.json",
+      "sha256": "18666a0d4bfc543e98328b39afbef9b7b1f9171161287bc6bc9ee26cfe249324"
+    },
+    {
+      "file": "DB1-quadro.json",
+      "sha256": "30c8b5ccd288d3332e35342ea94c8df57574afc126b0cace36fa90fcda6f5fb2"
+    },
+    {
+      "file": "DB2-quadro.json",
+      "sha256": "75f2bdd3f6a25dddee047cf36ffbe9887466bc3a8291ef278b4d645ba9ae0f4b"
+    },
+    {
+      "file": "DB3-quadro.json",
+      "sha256": "7f3fa41e7b77349f921d94749796f7f599ece2fae96e6c96425f50ca13a8856a"
+    },
+    {
+      "file": "DB4-quadro.json",
+      "sha256": "7ff613eb6a2e17d1bfc8a465130fb0e17e2270505fd3a31cdb86144585b39fb6"
+    },
+    {
+      "file": "DB5-quadro.json",
+      "sha256": "4acf0b48949081e2db03325816019c7acfb0b34de541adceda72336ad2b10209"
+    },
+    {
+      "file": "DB6-quadro.json",
+      "sha256": "a66a6d770778e570e9a45d921ab32c5cbbc6d106b9a2b5f8974a4cdab26629aa"
+    },
+    {
+      "file": "DB7-quadro.json",
+      "sha256": "2228a3b6951d170927d645460ee06f1438a36740e8c2f41d1003536886076b7c"
+    },
+    {
+      "file": "DB8-quadro.json",
+      "sha256": "76c3043e9c442e8d0c6c0d9bdcebfb4340692832f9c927eb72469b460c9898f3"
+    },
+    {
+      "file": "DB9-quadro.json",
+      "sha256": "177016893148b3df3c75a01bcd9bebeb469f157f2c4f9792be4c2b87e9166599"
+    },
+    {
+      "file": "DB10-quadro.json",
+      "sha256": "e7aea80aaa0a9bcf8e40b7db3e295eb34beeed9da25cf6ea849bd770240312ac"
+    }
+  ],
+  "qualification": {
+    "status": "single-card discovery profile; not cross-chassis, simultaneous-population, or thermal qualification",
+    "simultaneous_multiple_cards_tested": false,
+    "cross_chassis_tested": false
+  },
+  "excluded_integrated_display": {
+    "vendor": "0x8086",
+    "device": "0x1902",
+    "condition": "direct-host-root topology only"
+  }
+}
